@@ -1,13 +1,16 @@
 <div align="center">
     <img src="resources/branding/app_icon/raw.png"
-        title="Helium" alt="Helium logo" width="120" />
-    <h1>Helium</h1>
+        title="Helium (Zen)" alt="Helium (Zen) logo" width="120" />
+    <h1>Helium (Zen)</h1>
     <p>
         The Chromium-based web browser made for people, with love.
         <br>
         Privacy-first with unbiased ad-blocking. No bloat and no noise.
-    </p>
-    <a href="https://helium.computer/">
+    </p>    
+	<p>
+		Helium (Zen) is an AI-slop fork of Helium, adding workspaces and a full sidebar experience like in Zen.
+	</p>
+	<a href="https://helium.computer/">
         helium.computer
     </a>
 </div>
