@@ -1,0 +1,95 @@
+name: Build Linux x86_64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: prepare
+
+  build_1:
+    needs: prepare
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_2:
+    needs: build_1
+    if: needs.build_1.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_3:
+    needs: build_2
+    if: needs.build_2.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_4:
+    needs: build_3
+    if: needs.build_3.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_5:
+    needs: build_4
+    if: needs.build_4.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_6:
+    needs: build_5
+    if: needs.build_5.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_7:
+    needs: build_6
+    if: needs.build_6.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_8:
+    needs: build_7
+    if: needs.build_7.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_9:
+    needs: build_8
+    if: needs.build_8.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+
+  build_10:
+    needs: build_9
+    if: needs.build_9.outputs.status == 'running'
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: build
+      final: true
+
+  package:
+    # Later build jobs are skipped once an earlier chunk completes.
+    if: ${{ !cancelled() && !failure() }}
+    needs: [prepare, build_1, build_2, build_3, build_4, build_5, build_6, build_7, build_8, build_9, build_10]
+    uses: ./.github/workflows/linux-build-stage.yml
+    with:
+      stage: package
