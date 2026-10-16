@@ -80,6 +80,40 @@ recommended development environment for community contributions.
 Linux packaging includes a similar development script, so the same guide
 can be applied there too.
 
+[> See development docs in macOS repo](https://github.com/imputnet/helium-macos/blob/main/docs/building.md#development-build-and-environment)
+
+## Build your own Linux version
+
+The **Build Linux x86_64** GitHub Actions workflow builds this fork on
+GitHub-hosted Ubuntu runners. Commit and push the workflow to your fork's default
+branch, then open **Actions → Build Linux x86_64 → Run workflow**. Select the
+branch to build and start the run.
+
+When the `package` job succeeds, download `helium-zen-linux-x86_64-<commit>` from
+the run's **Artifacts** section. It contains an unsigned AppImage, a `.tar.xz`
+archive, and a `.deb` package. Extract the downloaded artifact ZIP first; for the
+AppImage, run `chmod +x helium-*.AppImage` before launching it. No signing secrets
+or local build machine are required.
+
+The workflow checks out this fork at the selected commit inside the Linux build
+tooling, pinned to `imputnet/helium-linux` commit
+`b154afccb44729359c816754c7741efb3cb8f497`. It falls back to cloning Chromium if
+source archives are unavailable. Builds use reduced optimization and omit debug
+symbols and PGO to reduce resource requirements. The AppImage does not advertise
+updates from upstream Helium.
+
+Chromium compilation can take many hours. Up to ten five-hour compilation jobs
+resume the same build through intermediate artifacts, leaving time within
+GitHub's six-hour job limit to restore and save progress. Unneeded compilation
+jobs are skipped after completion. Intermediate artifacts expire after seven
+days; downloadable packages expire after fourteen days. Source/build artifacts
+are large, so check your account's artifact storage and Actions usage allowance,
+especially for private repositories. Runner disk or memory limits can still
+cause a build to fail.
+
+When updating the pinned Linux tooling, review
+`.github/scripts/configure-linux-build.py` as well: its strict replacements fail
+if the expected platform scripts change.
 ## Contributing
 Before contributing to Helium, please read the guidelines in
 [CONTRIBUTING.md](CONTRIBUTING.md).
