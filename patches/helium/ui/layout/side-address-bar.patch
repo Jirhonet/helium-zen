@@ -1,0 +1,1070 @@
+--- a/chrome/app/settings_strings.grdp
++++ b/chrome/app/settings_strings.grdp
+@@ -307,6 +307,9 @@
+     <message name="IDS_SETTINGS_CENTERED_LOCATION_BAR" desc="Label for the toggle to use a centered address bar.">
+       Centered address bar
+     </message>
++    <message name="IDS_SETTINGS_SIDE_LOCATION_BAR" desc="Label for the toggle that shows the address bar and navigation buttons above the vertical tabs.">
++      Show address bar on the side
++    </message>
+     <message name="IDS_SETTINGS_MINIMAL_LOCATION_BAR" desc="Label for the toggle that enables the minimal URL in the address bar, showing only the site origin.">
+       Minimal URL in the address bar
+     </message>
+--- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
++++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
+@@ -226,6 +226,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil::GetAllowlistedKeys() {
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumCenteredLocationBar] =
+       settings_api::PrefType::kBoolean;
++  (*s_allowlist)[::prefs::kHeliumSideLocationBar] =
++      settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumMinimalLocationBar] =
+       settings_api::PrefType::kBoolean;
+   (*s_allowlist)[::prefs::kHeliumShowProgressBar] =
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
+@@ -79,6 +79,11 @@ export function getHtml(this: SettingsAppearancePageElement) {
+           pref-key="helium.browser.vertical_right_aligned"
+           label="$i18n{tabStripRightAlign}">
+       </settings-toggle-button>
++      <settings-toggle-button class="hr"
++          ?hidden="${!this.showVerticalSettings_()}"
++          pref-key="helium.browser.side_location_bar"
++          label="$i18n{sideLocationBar}">
++      </settings-toggle-button>
+       <settings-toggle-button class="hr"
+           ?hidden="${!this.showCenteredLocationBarSetting_()}"
+           pref-key="helium.browser.centered_location_bar"
+--- a/chrome/browser/ui/browser_ui_prefs.cc
++++ b/chrome/browser/ui/browser_ui_prefs.cc
+@@ -139,6 +139,8 @@ void RegisterBrowserUserPrefs(user_prefs::PrefRegistrySyncable* registry) {
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumCenteredLocationBar, false);
+ 
++  registry->RegisterBooleanPref(prefs::kHeliumSideLocationBar, false);
++
+   registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
+ 
+   registry->RegisterBooleanPref(prefs::kHeliumShowProgressBar, true);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1151,6 +1151,10 @@ BrowserView::BrowserView(BrowserWindowInterface* browser)
+       prefs::kHeliumZenModeTopChromePinned,
+       base::BindRepeating(&BrowserView::OnZenModeTopChromePinnedPrefChanged,
+                           base::Unretained(this)));
++  registrar_.Add(
++      prefs::kHeliumSideLocationBar,
++      base::BindRepeating(&BrowserView::UpdateSideLocationBarPlacement,
++                          base::Unretained(this)));
+   UpdateFullscreenAllowedFromPolicy(CanFullscreen());
+ 
+   WebUIContentsPreloadManager::GetInstance()->WarmupForBrowser(browser_.get());
+@@ -1174,6 +1178,10 @@ BrowserView::BrowserView(BrowserWindowInterface* browser)
+         vertical_tab_strip_state_controller->RegisterOnModeChanged(
+             base::BindRepeating(&BrowserView::OnVerticalTabStripModeChanged,
+                                 base::Unretained(this)));
++    vertical_tab_collapse_subscription_ =
++        vertical_tab_strip_state_controller->RegisterOnCollapseChanged(
++            base::BindRepeating(&BrowserView::OnVerticalTabStripCollapseChanged,
++                                base::Unretained(this)));
+   }
+ 
+   GetViewAccessibility().SetRole(ax::mojom::Role::kClient);
+@@ -1358,7 +1366,9 @@ ClientFrameElementInfo BrowserView::GetFrameElementInfo() const {
+                 .height()
+           : 0;
+   if (toolbar_ && ShouldDrawVerticalTabStrip()) {
+-    info.toolbar_minimum_height = toolbar_->GetMinimumSize().height();
++    info.toolbar_minimum_height = toolbar_->IsSideLayoutEnabled()
++                                      ? toolbar_->GetSingleRowHeight()
++                                      : toolbar_->GetMinimumSize().height();
+   } else if (web_app_frame_toolbar_ && ShouldDrawWebAppFrameToolbar()) {
+     info.toolbar_minimum_height =
+         web_app_frame_toolbar_->GetMinimumSize().height();
+@@ -1771,6 +1781,7 @@ void BrowserView::OnVerticalTabStripModeChanged(
+   if (vertical_initialized == should_be_vertical) {
+     // Mode is unchanged; just re-layout so alignment-dependent views update.
+     UpdateZenCollapseButtonVisibility();
++    UpdateSideLocationBarPlacement();
+     vertical_tab_strip_region_view_->InvalidateLayout();
+     InvalidateLayout();
+     return;
+@@ -1787,6 +1798,7 @@ void BrowserView::OnVerticalTabStripModeChanged(
+ 
+   GetFrameView()->OnTabStripStateChanged();
+ 
++  UpdateSideLocationBarPlacement();
+   UpdateTabSearchBubbleHost();
+   InvalidateLayout();
+ }
+@@ -1813,10 +1825,71 @@ void BrowserView::OnToolbarTabStripStateChanged(
+   }
+ 
+   UpdateZenModeState();
++  UpdateSideLocationBarPlacement();
+   UpdateTabSearchBubbleHost();
+   InvalidateLayout();
+ }
+ 
++void BrowserView::OnVerticalTabStripCollapseChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  UpdateSideLocationBarPlacement();
++}
++
++bool BrowserView::ShouldUseSideLocationBar() const {
++  if (!toolbar_ || !toolbar_->CanUseSideLayout() || !GetIsNormalType() ||
++      !GetProfile()->GetPrefs()->GetBoolean(prefs::kHeliumSideLocationBar)) {
++    return false;
++  }
++
++  auto* const layout_controller = HeliumLayoutStateController::From(browser_);
++  if (!layout_controller || !layout_controller->IsVerticalLayout()) {
++    return false;
++  }
++
++  // A collapsed tab strip is too narrow for the address bar, so the toolbar
++  // goes back to the top of the window.
++  auto* const vertical_tab_strip_controller =
++      tabs::VerticalTabStripStateController::From(browser_);
++  if (!vertical_tab_strip_controller ||
++      !vertical_tab_strip_controller->ShouldDisplayVerticalTabs() ||
++      vertical_tab_strip_controller->GetCollapseState() !=
++          tabs::VerticalTabStripCollapseState::kExpanded) {
++    return false;
++  }
++
++  // Zen mode and fullscreen manage the top chrome themselves.
++  return !IsZenModeEnabled() && !IsFullscreen();
++}
++
++void BrowserView::UpdateSideLocationBarPlacement() {
++  if (!toolbar_ || !top_container_ || !GetWidget()) {
++    return;
++  }
++
++  const bool use_side_location_bar = ShouldUseSideLocationBar();
++  if (use_side_location_bar == (toolbar_->parent() == this)) {
++    return;
++  }
++
++  if (use_side_location_bar) {
++    // Paint above the web contents, so the address bar can float over them
++    // while editing, but below the vertical tab strip.
++    const std::optional<size_t> index =
++        vertical_tab_strip_region_view_
++            ? GetIndexOf(vertical_tab_strip_region_view_.get())
++            : std::nullopt;
++    AddChildViewAt(toolbar_.get(), index.value_or(children().size()));
++    toolbar_->SetPaintToLayer();
++    toolbar_->layer()->SetFillsBoundsOpaquely(false);
++  } else {
++    toolbar_->DestroyLayer();
++    top_container_->AddChildViewAt(toolbar_.get(), 0);
++  }
++
++  toolbar_->SetSideLayoutEnabled(use_side_location_bar);
++  InvalidateLayout();
++}
++
+ void BrowserView::OnZenModeSideChromePinnedPrefChanged() {
+   if (!zen_mode_enabled_) {
+     return;
+@@ -1883,6 +1956,7 @@ void BrowserView::MaybeExpandVerticalTabStripForZenMode() {
+ void BrowserView::UpdateZenModeState() {
+   const bool zen_mode_enabled = IsZenModeEnabled();
+   UpdateZenModeEventMonitor();
++  UpdateSideLocationBarPlacement();
+ 
+   if (zen_mode_enabled_ == zen_mode_enabled) {
+     if (zen_mode_enabled_) {
+@@ -2913,6 +2987,8 @@ void BrowserView::FullscreenStateChanging() {
+ }
+ 
+ void BrowserView::FullscreenStateChanged() {
++  UpdateSideLocationBarPlacement();
++
+ #if BUILDFLAG(IS_CHROMEOS)
+   const auto* frame_view =
+       views::AsViewClass<BrowserFrameViewChromeOS>(GetFrameView());
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -368,6 +368,9 @@ class BrowserView : public BrowserWindow,
+   // Returns whether tabs should be shown in the toolbar.
+   bool ShouldDrawToolbarTabStrip() const;
+ 
++  // Returns whether the toolbar should be shown above the vertical tab strip.
++  bool ShouldUseSideLocationBar() const;
++
+   // Returns whether or not strokes should be drawn around and under the tabs.
+   bool ShouldDrawTabStrokes() const;
+ 
+@@ -939,6 +942,13 @@ class BrowserView : public BrowserWindow,
+ 
+   void OnToolbarTabStripStateChanged(HeliumLayoutStateController* controller);
+ 
++  void OnVerticalTabStripCollapseChanged(
++      tabs::VerticalTabStripCollapseState state);
++
++  // Moves the toolbar between the top container and the vertical tab strip
++  // column, depending on ShouldUseSideLocationBar().
++  void UpdateSideLocationBarPlacement();
++
+   void OnOrganizerPanelStateChanged(OrganizerPanelStateController* controller);
+ 
+   // Zen mode helpers.
+@@ -1462,6 +1472,8 @@ class BrowserView : public BrowserWindow,
+ 
+   base::CallbackListSubscription vertical_tab_subscription_;
+ 
++  base::CallbackListSubscription vertical_tab_collapse_subscription_;
++
+   std::unique_ptr<tabs::VerticalTabStripStateController::ScopedEnableStateLock>
+       vertical_tabs_enable_state_lock_;
+ 
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -47,6 +47,7 @@
+ #include "chrome/browser/ui/views/tabs/organizer/layout_constants.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_utils.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_view.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/gfx/geometry/insets.h"
+@@ -73,6 +74,11 @@ constexpr int kVerticalTabsGrabHandleSize = 40;
+ // against the frame controls when it is the top-most row.
+ constexpr int kTopToolbarExclusion = 10;
+ 
++// Size and position of the side address bar while it floats over the web
++// contents.
++constexpr int kSideLocationBarExpandedMaxWidth = 720;
++constexpr int kSideLocationBarExpandedMargin = 24;
++
+ constexpr int kZenModeVTSPadding = 8;
+ 
+ struct ZenModeLayoutState {
+@@ -748,6 +754,12 @@ bool BrowserViewTabbedLayoutImpl::ShowDynamicTabStrip(
+          browser->GetTabStripModel()->count() > 1;
+ }
+ 
++bool BrowserViewTabbedLayoutImpl::IsSideLocationBar() const {
++  return GetTabStripType() == TabStripType::kVertical &&
++         IsParentedTo(views().toolbar, views().browser_view) &&
++         views::IsViewClass<ToolbarView>(views().toolbar.get());
++}
++
+ BrowserViewTabbedLayoutImpl::VerticalTabStripCollapsedState
+ BrowserViewTabbedLayoutImpl::GetVerticalTabStripCollapsedState() const {
+   if (!views().vertical_tab_strip_region_view) {
+@@ -777,6 +789,24 @@ int BrowserViewTabbedLayoutImpl::GetCollapsedVerticalTabStripRelativeTop()
+ 
+   const auto& params = layout_data_->revised_params;
+ 
++  if (IsSideLocationBar()) {
++    if (!delegate().IsToolbarVisible()) {
++      return 0;
++    }
++    const bool right_aligned = delegate().IsVerticalTabStripRightAligned();
++    const BrowserLayoutExclusionArea& exclusion =
++        right_aligned ? params.trailing_exclusion : params.leading_exclusion;
++    const gfx::SizeF exclusion_size =
++        exclusion.IsEmpty() ? gfx::SizeF() : exclusion.ContentWithPadding();
++    const int exclusion_width = base::ClampCeil(exclusion_size.width());
++    auto* const toolbar =
++        views::AsViewClass<ToolbarView>(views().toolbar.get());
++    toolbar->SetSideLayoutExclusion(right_aligned ? 0 : exclusion_width,
++                                    right_aligned ? exclusion_width : 0,
++                                    base::ClampCeil(exclusion_size.height()));
++    return toolbar->GetPreferredSize().height();
++  }
++
+   if (delegate().IsToolbarVisible()) {
+     return GetBoundsWithExclusion(params, views().toolbar).height();
+   }
+@@ -859,6 +889,8 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+   const BrowserLayoutParams top_container_parent_params = params;
+   const bool vertical_right_aligned =
+       delegate().IsVerticalTabStripRightAligned();
++  const bool side_location_bar = IsSideLocationBar();
++  std::optional<gfx::Rect> side_toolbar_bounds;
+ 
+   // Lay out horizontal tab strip region if present.
+   if (!dynamic_tab_strip &&
+@@ -983,6 +1015,22 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+                         zen.ShouldLayoutVerticalTabStrip());
+   }
+ 
++  // Lay out the side toolbar in the space above the vertical tab strip. Its
++  // final bounds are set once the contents bounds are known.
++  if (IsParentedTo(views().toolbar, views().browser_view)) {
++    const bool toolbar_visible = side_location_bar &&
++                                 delegate().IsToolbarVisible() &&
++                                 !vertical_tab_strip_bounds.IsEmpty();
++    if (toolbar_visible) {
++      side_toolbar_bounds = gfx::Rect(
++          vertical_tab_strip_bounds.x(), params.visual_client_area.y(),
++          vertical_tab_strip_bounds.width(),
++          vertical_tab_strip_bounds.y() - params.visual_client_area.y());
++    }
++    layout.AddChild(views().toolbar, side_toolbar_bounds.value_or(gfx::Rect()),
++                    toolbar_visible);
++  }
++
+   if (IsParentedTo(views().vertical_tab_strip_background_blur_backdrop,
+                    views().browser_view)) {
+     layout.AddChild(
+@@ -1033,7 +1081,8 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+ 
+     // Calculate the params for laying out the top container.
+     const BrowserLayoutParams& parent_params =
+-        layout_data_->tab_strip_type == TabStripType::kVertical
++        layout_data_->tab_strip_type == TabStripType::kVertical &&
++                !side_location_bar
+             ? top_container_parent_params
+             : params;
+     auto top_container_params =
+@@ -1045,7 +1094,7 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+         top_container_local_bounds, parent_params);
+ 
+     if (layout_data_->tab_strip_type == TabStripType::kVertical &&
+-        !zen.floating_vertical_tab_strip) {
++        !zen.floating_vertical_tab_strip && !side_location_bar) {
+       auto& top_container_children = top_container_layout.children;
+       auto bookmarks_child = top_container_children.find(views().bookmark_bar);
+       if (bookmarks_child != top_container_children.end() &&
+@@ -1387,6 +1436,37 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+                                 content_right - content_left,
+                                 params.visual_client_area.height()));
+ 
++  if (side_toolbar_bounds) {
++    auto* const toolbar =
++        views::AsViewClass<ToolbarView>(views().toolbar.get());
++    gfx::Rect toolbar_bounds = *side_toolbar_bounds;
++    std::optional<gfx::Rect> floating_bounds;
++    if (toolbar->IsSideLocationBarExpanded()) {
++      const gfx::Rect& contents_bounds = contents_layout.bounds;
++      const int width = std::min(
++          kSideLocationBarExpandedMaxWidth,
++          contents_bounds.width() - 2 * kSideLocationBarExpandedMargin);
++      if (width > side_toolbar_bounds->width()) {
++        floating_bounds = gfx::Rect(
++            contents_bounds.x() + (contents_bounds.width() - width) / 2,
++            contents_bounds.y() + std::max(kSideLocationBarExpandedMargin,
++                                           contents_bounds.height() / 6),
++            width, toolbar->location_bar_view()->GetPreferredSize().height());
++        toolbar_bounds.Union(*floating_bounds);
++      }
++    }
++
++    // The toolbar covers both the side slot and the floating address bar; tell
++    // it where each of them is in its own coordinates.
++    gfx::Rect slot = *side_toolbar_bounds;
++    slot.Offset(-toolbar_bounds.OffsetFromOrigin());
++    if (floating_bounds) {
++      floating_bounds->Offset(-toolbar_bounds.OffsetFromOrigin());
++    }
++    toolbar->SetSideLayoutGeometry(slot, floating_bounds);
++    layout.children.find(views().toolbar)->second.bounds = toolbar_bounds;
++  }
++
+   // Maybe expand and clip the web contents to avoid issues during animation.
+   if (features::UseSidePanelFlyoverAnimation()) {
+     if (clip_content_for_animation) {
+@@ -1459,7 +1539,7 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+     bool has_leading_exclusion = false;
+ 
+     // If the toolbar is not in the browser, then the exclusion isn't either.
+-    if (toolbar_bounds) {
++    if (toolbar_bounds && !side_location_bar) {
+       const BrowserLayoutExclusionArea& side_exclusion =
+           vertical_right_aligned ? browser_params.trailing_exclusion
+                                  : browser_params.leading_exclusion;
+@@ -1567,6 +1647,23 @@ gfx::Rect BrowserViewTabbedLayoutImpl::CalculateTopContainerLayout(
+                     toolbar_visible && toolbar_bounds.height() > 0);
+   }
+ 
++  // With the toolbar above the vertical tab strip, leave an empty strip for
++  // caption buttons that are above the contents.
++  if (needs_exclusion && IsSideLocationBar() && delegate().IsToolbarVisible()) {
++    const float exclusion_height =
++        std::max(params.leading_exclusion.IsEmpty()
++                     ? 0.f
++                     : params.leading_exclusion.ContentWithPadding().height(),
++                 params.trailing_exclusion.IsEmpty()
++                     ? 0.f
++                     : params.trailing_exclusion.ContentWithPadding().height());
++    if (exclusion_height > 0.f) {
++      params.SetTop(params.visual_client_area.y() +
++                    base::ClampCeil(exclusion_height));
++      needs_exclusion = false;
++    }
++  }
++
+   // Clamp the margins visually by overlapping toolbar and the tab strip
+   if (dynamic_tab_strip && show_dynamic_tab_strip && zen.TopChromeVisible()) {
+     const int toolbar_tabstrip_overlap =
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.h
+@@ -95,6 +95,9 @@ class BrowserViewTabbedLayoutImpl : public BrowserViewLayoutImpl {
+   bool ShowDynamicTabStrip(TabStripType tab_strip_type) const;
+   TabStripType GetTabStripType() const;
+ 
++  // Returns whether the toolbar is shown above the vertical tab strip.
++  bool IsSideLocationBar() const;
++
+   // Returns the current state of the vertical tabstrip.
+   VerticalTabStripCollapsedState GetVerticalTabStripCollapsedState() const;
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_controller.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_controller.cc
+@@ -346,6 +346,16 @@ bool ToolbarController::EndPopOut(ui::ElementIdentifier identifier) {
+   return true;
+ }
+ 
++bool ToolbarController::IsPoppedOut(const views::View* view) const {
++  const ui::ElementIdentifier identifier =
++      view->GetProperty(views::kElementIdentifierKey);
++  if (!identifier) {
++    return false;
++  }
++  const auto it = pop_out_state_.find(identifier);
++  return it != pop_out_state_.end() && it->second->is_popped_out;
++}
++
+ bool ToolbarController::ShouldShowOverflowButton(gfx::Size available_size) {
+   if (ToolbarControllerUtil::PreventOverflow()) {
+     return false;
+--- a/chrome/browser/ui/views/toolbar/toolbar_controller.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_controller.h
+@@ -155,6 +155,9 @@ class ToolbarController : public OverflowMenu::Delegate {
+   // action is successful.
+   virtual bool EndPopOut(ui::ElementIdentifier identifier);
+ 
++  // Returns whether `view` is currently forced to show.
++  bool IsPoppedOut(const views::View* view) const;
++
+   // Returns true if any overflow-able elements are hidden when
+   // `toolbar_container_view_` is set to `size`. This excludes the overflow
+   // button itself from the calculation, providing a much more accurate idea of
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -9,7 +9,10 @@
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "base/containers/contains.h"
+ #include "base/containers/fixed_flat_map.h"
++#include "base/containers/flat_map.h"
++#include "base/containers/flat_set.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -170,6 +173,7 @@
+ #include "ui/views/vector_icons.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
++#include "ui/views/view_targeter.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/tooltip_manager.h"
+ #include "ui/views/widget/widget.h"
+@@ -273,10 +277,17 @@ class CenteredLocationBarLayout : public views::FlexLayout {
+  public:
+   using GetCenteredBoundsCallback =
+       base::RepeatingCallback<gfx::Rect(gfx::Rect, int)>;
++  using SideLayoutCallback =
++      base::RepeatingCallback<std::optional<views::ProposedLayout>(
++          const views::SizeBounds&,
++          const base::RepeatingCallback<bool(const views::View*)>&)>;
+ 
+   CenteredLocationBarLayout(views::View* location_bar,
+-                            GetCenteredBoundsCallback callback)
+-      : location_bar_(location_bar), callback_(std::move(callback)) {}
++                            GetCenteredBoundsCallback callback,
++                            SideLayoutCallback side_layout_callback)
++      : location_bar_(location_bar),
++        callback_(std::move(callback)),
++        side_layout_callback_(std::move(side_layout_callback)) {}
+ 
+   CenteredLocationBarLayout(const CenteredLocationBarLayout&) = delete;
+   CenteredLocationBarLayout& operator=(const CenteredLocationBarLayout&) =
+@@ -297,9 +308,29 @@ class CenteredLocationBarLayout : public views::FlexLayout {
+     ApplyLayout(layout);
+   }
+ 
++  views::ProposedLayout CalculateProposedLayout(
++      const views::SizeBounds& size_bounds) const override {
++    if (side_layout_callback_) {
++      std::optional<views::ProposedLayout> side_layout =
++          side_layout_callback_.Run(
++              size_bounds,
++              base::BindRepeating(&CenteredLocationBarLayout::IsIncluded,
++                                  base::Unretained(this)));
++      if (side_layout) {
++        return *std::move(side_layout);
++      }
++    }
++    return views::FlexLayout::CalculateProposedLayout(size_bounds);
++  }
++
+  private:
++  bool IsIncluded(const views::View* child) const {
++    return IsChildIncludedInLayout(child);
++  }
++
+   const raw_ptr<views::View> location_bar_;
+   GetCenteredBoundsCallback callback_;
++  SideLayoutCallback side_layout_callback_;
+ };
+ 
+ }  // namespace
+@@ -337,6 +368,8 @@ ToolbarView::ToolbarView(BrowserWindowInterface* browser,
+ 
+   mouse_watcher_ = std::make_unique<views::MouseWatcher>(
+       std::make_unique<views::MouseWatcherViewHost>(this, gfx::Insets()), this);
++
++  SetEventTargeter(std::make_unique<views::ViewTargeter>(this));
+ }
+ 
+ ToolbarView::~ToolbarView() {
+@@ -730,6 +763,10 @@ void ToolbarView::Init() {
+ 
+   if (location_bar_view_) {
+     location_bar_view_->Init();
++    if (views::View* omnibox_view =
++            location_bar_view_->GetViewByID(VIEW_ID_OMNIBOX)) {
++      omnibox_view_observation_.Observe(omnibox_view);
++    }
+   } else {
+     toolbar_webview_->GetLocationBar()->Init(toolbar_webview_.get());
+   }
+@@ -1612,6 +1649,9 @@ gfx::Size ToolbarView::CalculatePreferredSize(
+       break;
+     case DisplayMode::kNormal:
+       size = AccessiblePaneView::CalculatePreferredSize(available_size);
++      if (side_layout_enabled_) {
++        break;
++      }
+       // Because there are odd cases where something causes one of the views in
+       // the toolbar to report an unreasonable height (see crbug.com/41471763),
+       // we cap the height at the size of known child views (location bar and
+@@ -1639,6 +1679,11 @@ gfx::Size ToolbarView::GetMinimumSize() const {
+       size = location_bar_->MinimumSize();
+       break;
+     case DisplayMode::kNormal:
++      if (side_layout_enabled_) {
++        // The side toolbar is not part of the main area, so it does not
++        // constrain the window size.
++        break;
++      }
+       size = AccessiblePaneView::GetMinimumSize();
+       // Because there are odd cases where something causes one of the views in
+       // the toolbar to report an unreasonable height (see crbug.com/41471763),
+@@ -1758,6 +1803,45 @@ void ToolbarView::ChildVisibilityChanged(views::View* child) {
+   }
+ }
+ 
++void ToolbarView::OnPaintBackground(gfx::Canvas* canvas) {
++  // While the side address bar floats, the toolbar also covers the web
++  // contents. Only paint the background behind the side toolbar.
++  if (side_layout_enabled_ && side_layout_slot_ &&
++      *side_layout_slot_ != GetLocalBounds()) {
++    gfx::ScopedCanvas scoped_canvas(canvas);
++    canvas->ClipRect(GetMirroredRect(*side_layout_slot_));
++    AccessiblePaneView::OnPaintBackground(canvas);
++    return;
++  }
++  AccessiblePaneView::OnPaintBackground(canvas);
++}
++
++void ToolbarView::OnViewFocused(views::View* observed_view) {
++  SetSideLocationBarExpanded(true);
++}
++
++void ToolbarView::OnViewBlurred(views::View* observed_view) {
++  SetSideLocationBarExpanded(false);
++}
++
++void ToolbarView::OnViewIsDeleting(views::View* observed_view) {
++  omnibox_view_observation_.Reset();
++}
++
++bool ToolbarView::DoesIntersectRect(const views::View* target,
++                                    const gfx::Rect& rect) const {
++  if (!side_layout_enabled_ || !side_layout_slot_) {
++    return ViewTargeterDelegate::DoesIntersectRect(target, rect);
++  }
++  // Let events in the gap between the side toolbar and the floating address
++  // bar reach the web contents.
++  if (GetMirroredRect(*side_layout_slot_).Intersects(rect)) {
++    return true;
++  }
++  return side_floating_location_bar_bounds_ &&
++         GetMirroredRect(*side_floating_location_bar_bounds_).Intersects(rect);
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // ToolbarView, private:
+ 
+@@ -1776,6 +1860,8 @@ void ToolbarView::InitLayout() {
+       SetLayoutManager(std::make_unique<CenteredLocationBarLayout>(
+           location_bar_view_,
+           base::BindRepeating(&ToolbarView::GetCenteredLocationBarBounds,
++                              base::Unretained(this)),
++          base::BindRepeating(&ToolbarView::CalculateSideLayout,
+                               base::Unretained(this))));
+ 
+   layout_manager_->SetOrientation(views::LayoutOrientation::kHorizontal)
+@@ -1941,9 +2027,11 @@ void ToolbarView::LayoutCommon() {
+   // geometry and invoke `ToolbarView::Layout()`. This layout pass guarantees
+   // `SetIsMaximizedOrFullscreen` remains reliably synchronized with window
+   // bounds without requiring supplemental widget observation hooks.
++  // The side toolbar never touches the window edge, so it skips this.
+   const bool is_maximized_or_fullscreen =
+-      browser_->GetWindow() && (browser_->GetWindow()->IsMaximized() ||
+-                                browser_->GetWindow()->IsFullscreen());
++      !side_layout_enabled_ && browser_->GetWindow() &&
++      (browser_->GetWindow()->IsMaximized() ||
++       browser_->GetWindow()->IsFullscreen());
+ 
+   const bool collapse_button_on_trailing_edge =
+       vertical_tabs_collapse_button_ &&
+@@ -2166,6 +2254,276 @@ void ToolbarView::UpdateDynamicNewTabButton() {
+                                       show_dynamic_new_tab_button_.GetValue());
+ }
+ 
++bool ToolbarView::CanUseSideLayout() const {
++  return display_mode_ == DisplayMode::kNormal && location_bar_view_ &&
++         !toolbar_webview_ && layout_manager_;
++}
++
++void ToolbarView::SetSideLayoutEnabled(bool enabled) {
++  enabled = enabled && CanUseSideLayout();
++  if (side_layout_enabled_ == enabled) {
++    return;
++  }
++
++  side_layout_enabled_ = enabled;
++  const views::View* const omnibox_view =
++      location_bar_view_->GetViewByID(VIEW_ID_OMNIBOX);
++  side_location_bar_expanded_ =
++      enabled && omnibox_view && omnibox_view->HasFocus();
++  if (!enabled) {
++    side_leading_exclusion_ = 0;
++    side_trailing_exclusion_ = 0;
++    side_exclusion_height_ = 0;
++    side_layout_slot_.reset();
++    side_floating_location_bar_bounds_.reset();
++  }
++
++  UpdateSideLayoutBackground();
++  PreferredSizeChanged();
++  SchedulePaint();
++}
++
++void ToolbarView::SetSideLayoutExclusion(int leading_width,
++                                         int trailing_width,
++                                         int height) {
++  if (side_leading_exclusion_ == leading_width &&
++      side_trailing_exclusion_ == trailing_width &&
++      side_exclusion_height_ == height) {
++    return;
++  }
++
++  side_leading_exclusion_ = leading_width;
++  side_trailing_exclusion_ = trailing_width;
++  side_exclusion_height_ = height;
++  PreferredSizeChanged();
++}
++
++void ToolbarView::SetSideLayoutGeometry(
++    const std::optional<gfx::Rect>& slot,
++    const std::optional<gfx::Rect>& floating_bounds) {
++  if (side_layout_slot_ == slot &&
++      side_floating_location_bar_bounds_ == floating_bounds) {
++    return;
++  }
++
++  side_layout_slot_ = slot;
++  side_floating_location_bar_bounds_ = floating_bounds;
++  InvalidateLayout();
++  SchedulePaint();
++}
++
++bool ToolbarView::IsSideLocationBarExpanded() const {
++  return side_layout_enabled_ && side_location_bar_expanded_;
++}
++
++int ToolbarView::GetSingleRowHeight() const {
++  const int interior_height =
++      layout_manager_ ? layout_manager_->interior_margin().height() : 0;
++  return std::max(location_bar_->PreferredSize().height(),
++                  GetBackForwardButtonSize().height()) +
++         interior_height;
++}
++
++void ToolbarView::SetSideLocationBarExpanded(bool expanded) {
++  if (side_location_bar_expanded_ == expanded) {
++    return;
++  }
++
++  side_location_bar_expanded_ = expanded;
++  if (side_layout_enabled_) {
++    InvalidateLayout();
++  }
++}
++
++void ToolbarView::UpdateSideLayoutBackground() {
++  auto* const toolbar_background =
++      background() ? background()->AsA<CustomCornersBackground>() : nullptr;
++  if (!toolbar_background) {
++    return;
++  }
++
++  // Blend in with the vertical tab strip below.
++  toolbar_background->SetPrimaryColor(
++      side_layout_enabled_ ? CustomCornersBackground::FrameTheme()
++                           : CustomCornersBackground::ToolbarTheme());
++}
++
++std::optional<views::ProposedLayout> ToolbarView::CalculateSideLayout(
++    const views::SizeBounds& size_bounds,
++    const base::RepeatingCallback<bool(const views::View*)>& is_included)
++    const {
++  if (!side_layout_enabled_ || !location_bar_view_) {
++    return std::nullopt;
++  }
++
++  const int padding =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
++  const int spacing =
++      GetLayoutConstant(LayoutConstant::kToolbarIconDefaultMargin);
++  const int bottom_padding =
++      GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
++  const int row_height = GetSingleRowHeight();
++  const int location_bar_height =
++      location_bar_view_->GetPreferredSize().height();
++
++  // Only the always-visible buttons of the extensions and pinned actions
++  // containers are shown, the rest overflows.
++  const auto get_width = [this](const views::View* view) {
++    return view == extensions_container_.get() ||
++                   view == pinned_toolbar_actions_container_.get()
++               ? view->GetMinimumSize().width()
++               : view->GetPreferredSize().width();
++  };
++
++  // Buttons that may be shown in the top row, most important first. Anything
++  // that does not fit, and everything else in the toolbar, is hidden and can be
++  // reached through the overflow button.
++  std::vector<views::View*> candidates;
++  const auto add_candidate = [&](views::View* view) {
++    if (view && is_included.Run(view) && !base::Contains(candidates, view)) {
++      candidates.push_back(view);
++    }
++  };
++  add_candidate(app_menu_button_.get());
++  add_candidate(overflow_button_.get());
++  add_candidate(back_.get());
++  add_candidate(forward_.get());
++  add_candidate(reload_.get());
++  if (toolbar_controller_) {
++    for (views::View* child : children()) {
++      if (toolbar_controller_->IsPoppedOut(child)) {
++        add_candidate(child);
++      }
++    }
++  }
++  add_candidate(extensions_container_.get());
++  add_candidate(pinned_toolbar_actions_container_.get());
++  add_candidate(vertical_tabs_collapse_button_.get());
++
++  // Width needed next to the caption buttons before the top row moves below
++  // them. The overflow button is always counted so that showing it does not
++  // move the row back and forth.
++  int essential_width = 0;
++  const views::View* const essential_views[] = {
++      app_menu_button_.get(), overflow_button_.get(), back_.get(),
++      forward_.get(), reload_.get()};
++  for (const views::View* view : essential_views) {
++    if (view && (view == overflow_button_.get() || is_included.Run(view))) {
++      essential_width += get_width(view) + spacing;
++    }
++  }
++
++  int natural_row_width = 0;
++  for (const views::View* view : candidates) {
++    natural_row_width += get_width(view) + spacing;
++  }
++
++  const bool has_width = size_bounds.width().is_bounded();
++  const bool has_height = size_bounds.height().is_bounded();
++  const int host_width =
++      has_width ? size_bounds.width().value() : natural_row_width + 2 * padding;
++  const bool use_geometry =
++      has_width && has_height && side_layout_slot_.has_value();
++  const gfx::Rect slot =
++      use_geometry ? *side_layout_slot_ : gfx::Rect(0, 0, host_width, 0);
++
++  // Lay out the top row next to the caption buttons if they are above the
++  // vertical tab strip, or below them if the row does not fit.
++  const int row_left = slot.x() + padding;
++  const int row_right = slot.right() - padding;
++  const bool has_exclusion =
++      side_exclusion_height_ > 0 &&
++      (side_leading_exclusion_ > 0 || side_trailing_exclusion_ > 0);
++  const int beside_left =
++      std::max(row_left, slot.x() + side_leading_exclusion_);
++  const int beside_right =
++      std::min(row_right, slot.right() - side_trailing_exclusion_);
++  const bool row_below_exclusion =
++      has_exclusion && beside_right - beside_left < essential_width;
++
++  const int top_row_y =
++      slot.y() + (row_below_exclusion ? side_exclusion_height_ : 0);
++  const int top_row_height = has_exclusion && !row_below_exclusion
++                                 ? std::max(row_height, side_exclusion_height_)
++                                 : row_height;
++  const int top_row_left = row_below_exclusion ? row_left : beside_left;
++  const int top_row_right = row_below_exclusion ? row_right : beside_right;
++
++  base::flat_set<const views::View*> shown;
++  int remaining_width = top_row_right - top_row_left;
++  for (const views::View* view : candidates) {
++    const int width = get_width(view);
++    if (width <= 0) {
++      continue;
++    }
++    const int needed_width = width + (shown.empty() ? 0 : spacing);
++    if (needed_width > remaining_width) {
++      continue;
++    }
++    remaining_width -= needed_width;
++    shown.insert(view);
++  }
++
++  // Buttons before the address bar are placed at the leading edge and buttons
++  // after it at the trailing edge, keeping their regular order.
++  base::flat_map<const views::View*, gfx::Rect> child_bounds;
++  const auto get_row_bounds = [&](const views::View* view, int x) {
++    const int height =
++        std::min(view->GetPreferredSize().height(), top_row_height);
++    return gfx::Rect(x, top_row_y + (top_row_height - height) / 2,
++                     get_width(view), height);
++  };
++
++  const auto& toolbar_children = children();
++  const size_t location_bar_index = GetIndexOf(location_bar_view_).value();
++  int leading_x = top_row_left;
++  for (size_t i = 0; i < location_bar_index; ++i) {
++    const views::View* const child = toolbar_children[i];
++    if (shown.contains(child)) {
++      const gfx::Rect bounds = get_row_bounds(child, leading_x);
++      child_bounds[child] = bounds;
++      leading_x = bounds.right() + spacing;
++    }
++  }
++  int trailing_x = top_row_right;
++  for (size_t i = toolbar_children.size(); i > location_bar_index + 1; --i) {
++    const views::View* const child = toolbar_children[i - 1];
++    if (shown.contains(child)) {
++      const gfx::Rect bounds =
++          get_row_bounds(child, trailing_x - get_width(child));
++      child_bounds[child] = bounds;
++      trailing_x = bounds.x() - spacing;
++    }
++  }
++
++  const int location_bar_y = top_row_y + top_row_height;
++  child_bounds[location_bar_view_.get()] =
++      use_geometry && side_floating_location_bar_bounds_
++          ? *side_floating_location_bar_bounds_
++          : gfx::Rect(row_left, location_bar_y, row_right - row_left,
++                      location_bar_height);
++
++  views::ProposedLayout layout;
++  layout.host_size = gfx::Size(
++      host_width, has_height ? size_bounds.height().value()
++                             : location_bar_y + location_bar_height +
++                                   bottom_padding - slot.y());
++  for (views::View* child : children()) {
++    if (!is_included.Run(child)) {
++      continue;
++    }
++    views::ChildLayout& child_layout = layout.child_layouts.emplace_back();
++    child_layout.child_view = child;
++    const auto it = child_bounds.find(child);
++    child_layout.visible = it != child_bounds.end();
++    if (child_layout.visible) {
++      child_layout.bounds = it->second;
++      child_layout.available_size = views::SizeBounds(it->second.size());
++    }
++  }
++  return layout;
++}
++
+ // AppMenuIconController::Delegate:
+ void ToolbarView::UpdateTypeAndSeverity(
+     AppMenuIconController::TypeAndSeverity type_and_severity) {
+@@ -2423,7 +2781,7 @@ void ToolbarView::OnLocationBarCenteredChanged() {
+ 
+ void ToolbarView::UpdateLocationBarCentering() {
+   if (display_mode_ != DisplayMode::kNormal || !layout_manager_ ||
+-      !location_bar_is_centered_.GetValue()) {
++      side_layout_enabled_ || !location_bar_is_centered_.GetValue()) {
+     return;
+   }
+ 
+@@ -2439,7 +2797,8 @@ void ToolbarView::UpdateLocationBarCentering() {
+ 
+ gfx::Rect ToolbarView::GetCenteredLocationBarBounds(gfx::Rect bounds,
+                                                     int toolbar_width) const {
+-  if (IsCompactLayout() || display_mode_ != DisplayMode::kNormal ||
++  if (IsCompactLayout() || side_layout_enabled_ ||
++      display_mode_ != DisplayMode::kNormal ||
+       !location_bar_is_centered_.GetValue()) {
+     return bounds;
+   }
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <vector>
+ 
++#include "base/functional/callback_forward.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+@@ -37,8 +38,11 @@
+ #include "ui/views/accessible_pane_view.h"
+ #include "ui/views/animation/animation_delegate_views.h"
+ #include "ui/views/controls/button/menu_button.h"
++#include "ui/views/layout/proposed_layout.h"
+ #include "ui/views/mouse_watcher.h"
+ #include "ui/views/view.h"
++#include "ui/views/view_observer.h"
++#include "ui/views/view_targeter_delegate.h"
+ #include "url/origin.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -98,7 +102,9 @@ class ToolbarView : public views::AccessiblePaneView,
+                     public AppMenuIconController::Delegate,
+                     public ToolbarButtonProvider,
+                     public BrowserRootView::DropTarget,
+-                    public glic::GlicSplitButtonDelegate {
++                    public glic::GlicSplitButtonDelegate,
++                    public views::ViewObserver,
++                    public views::ViewTargeterDelegate {
+   METADATA_HEADER(ToolbarView, views::AccessiblePaneView)
+ 
+  public:
+@@ -265,6 +271,16 @@ class ToolbarView : public views::AccessiblePaneView,
+   bool AcceleratorPressed(const ui::Accelerator& acc) override;
+   void ChildPreferredSizeChanged(views::View* child) override;
+   void ChildVisibilityChanged(View* child) override;
++  void OnPaintBackground(gfx::Canvas* canvas) override;
++
++  // views::ViewObserver:
++  void OnViewFocused(views::View* observed_view) override;
++  void OnViewBlurred(views::View* observed_view) override;
++  void OnViewIsDeleting(views::View* observed_view) override;
++
++  // views::ViewTargeterDelegate:
++  bool DoesIntersectRect(const views::View* target,
++                         const gfx::Rect& rect) const override;
+ 
+   friend class AvatarToolbarButtonBaseBrowserTest;
+ 
+@@ -293,6 +309,33 @@ class ToolbarView : public views::AccessiblePaneView,
+   // Repositions the centered address bar after its parent's bounds are applied.
+   void UpdateLocationBarCentering();
+ 
++  // Side address bar: the toolbar is shown above the vertical tab strip, with
++  // the navigation buttons in a top row and the address bar below them.
++
++  // Returns whether this toolbar supports the side layout.
++  bool CanUseSideLayout() const;
++
++  // Switches between the regular and the side layout.
++  void SetSideLayoutEnabled(bool enabled);
++  bool IsSideLayoutEnabled() const { return side_layout_enabled_; }
++
++  // Sets the size of the caption button area the top row has to avoid.
++  void SetSideLayoutExclusion(int leading_width,
++                              int trailing_width,
++                              int height);
++
++  // Sets the area of the side toolbar within the toolbar bounds and, while the
++  // address bar is expanded, the bounds of the floating address bar. Both are
++  // in local coordinates.
++  void SetSideLayoutGeometry(const std::optional<gfx::Rect>& slot,
++                             const std::optional<gfx::Rect>& floating_bounds);
++
++  // Returns whether the side address bar should float over the web contents.
++  bool IsSideLocationBarExpanded() const;
++
++  // Returns the height of a single row of the toolbar.
++  int GetSingleRowHeight() const;
++
+  protected:
+   // This controls Toolbar, LocationBar and CustomTabBar visibility.
+   // If we don't set all three, tab navigation from the app menu breaks
+@@ -387,6 +430,16 @@ class ToolbarView : public views::AccessiblePaneView,
+   gfx::Rect GetCenteredLocationBarBounds(gfx::Rect bounds,
+                                          int toolbar_width) const;
+ 
++  // Returns the side layout, or nullopt if the regular layout should be used.
++  // `is_included` returns whether a child takes part in the layout.
++  std::optional<views::ProposedLayout> CalculateSideLayout(
++      const views::SizeBounds& size_bounds,
++      const base::RepeatingCallback<bool(const views::View*)>& is_included)
++      const;
++
++  void SetSideLocationBarExpanded(bool expanded);
++  void UpdateSideLayoutBackground();
++
+   void OnTouchUiChanged();
+ 
+   void NewTabButtonPressed(const ui::Event& event);
+@@ -546,6 +599,18 @@ class ToolbarView : public views::AccessiblePaneView,
+   base::CallbackListSubscription vertical_tab_collapse_subscription_;
+ 
+   bool should_display_vertical_tabs_ = false;
++
++  // Side address bar state.
++  bool side_layout_enabled_ = false;
++  bool side_location_bar_expanded_ = false;
++  int side_leading_exclusion_ = 0;
++  int side_trailing_exclusion_ = 0;
++  int side_exclusion_height_ = 0;
++  std::optional<gfx::Rect> side_layout_slot_;
++  std::optional<gfx::Rect> side_floating_location_bar_bounds_;
++  base::ScopedObservation<views::View, views::ViewObserver>
++      omnibox_view_observation_{this};
++
+   bool should_show_glic_button_ = false;
+   bool should_show_glic_actor_ = false;
+ 
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -611,6 +611,7 @@ void AddAppearanceStrings(content::WebUIDataSource* html_source,
+       {"zenModePinSidebar", IDS_SETTINGS_ZEN_PIN_SIDEBAR},
+       {"zenModePinToolbar", IDS_SETTINGS_ZEN_PIN_TOP_TOOLBAR},
+       {"centeredLocationBar", IDS_SETTINGS_CENTERED_LOCATION_BAR},
++      {"sideLocationBar", IDS_SETTINGS_SIDE_LOCATION_BAR},
+       {"verticalCollapseShortcut", IDS_SETTINGS_VERTICAL_COLLAPSE_SHORTCUT},
+       {"minimalLocationBar", IDS_SETTINGS_MINIMAL_LOCATION_BAR},
+       {"showProgressBar", IDS_SETTINGS_SHOW_PROGRESS_BAR},
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -650,6 +650,11 @@ inline constexpr char kHeliumZenModeTopChromePinned[] =
+ inline constexpr char kHeliumCenteredLocationBar[] =
+     "helium.browser.centered_location_bar";
+ 
++// A boolean pref set to true if the address bar and navigation controls should
++// be shown above the vertical tab strip instead of in the top toolbar.
++inline constexpr char kHeliumSideLocationBar[] =
++    "helium.browser.side_location_bar";
++
+ // A boolean pref set to true if the minimal location bar should be used.
+ inline constexpr char kHeliumMinimalLocationBar[] =
+     "helium.browser.minimal_location_bar";
